@@ -34,11 +34,17 @@ namespace DSO.Core.Evoker.Extend
             }
 
             var properties = ifaceType.GetProperties(BindingFlags.Public | BindingFlags.Instance);
-            var methods = ifaceType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
+            var allMethods = ifaceType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
                 .Where(m => !m.IsSpecialName) // get_X/set_X'leri (property accessor'ları) hariç tut
                 .ToList();
 
-            if (properties.Length == 0 && methods.Count == 0)
+            // Generic metotlar (ör. `T Get<T>()`) AYRI bir yoldan gidiyor - Func<>/Action<>
+            // veya DynamicDelegateTypeFactory bunları ifade EDEMEZ (bir metodun kendi açık
+            // generic parametresi, tip olarak başka bir metoda taşınamaz). Bkz. FAZ 3b.
+            var methods = allMethods.Where(m => !m.IsGenericMethodDefinition).ToList();
+            var genericMethods = allMethods.Where(m => m.IsGenericMethodDefinition).ToList();
+
+            if (properties.Length == 0 && allMethods.Count == 0)
             {
                 throw new ArgumentException($"[Extend] '{ifaceType.Name}' hiç üye içermiyor - implement edecek bir şey yok.");
             }
@@ -52,6 +58,11 @@ namespace DSO.Core.Evoker.Extend
             {
                 Type delegateType = DelegateTypeResolver.Resolve(m);
                 DelegateTypeResolver.AddMethodDynamic(dc, m.Name, delegateType);
+            }
+
+            foreach (var m in genericMethods)
+            {
+                dc.AddGenericMethod(m);
             }
 
             dc.WithTypeConfigurator((typeBuilder, members) =>
@@ -77,6 +88,16 @@ namespace DSO.Core.Evoker.Extend
                     if (!members.Methods.TryGetValue(m.Name, out var forwarder))
                     {
                         throw new InvalidOperationException($"[Extend] '{m.Name}' metodu için üretilen forwarder bulunamadı.");
+                    }
+
+                    typeBuilder.DefineMethodOverride(forwarder.Method, m);
+                }
+
+                foreach (var m in genericMethods)
+                {
+                    if (!members.GenericMethods.TryGetValue(m.Name, out var forwarder))
+                    {
+                        throw new InvalidOperationException($"[Extend] '{m.Name}' (generic) metodu için üretilen forwarder bulunamadı.");
                     }
 
                     typeBuilder.DefineMethodOverride(forwarder.Method, m);
@@ -118,6 +139,14 @@ namespace DSO.Core.Evoker.Extend
             Type[] paramTypes = method.GetParameters().Select(p => p.ParameterType).ToArray();
             Type returnType = method.ReturnType;
 
+            // Func<>/Action<> `ref`/`out` parametreleri (byref tipler) VEYA 16'dan fazla
+            // parametreyi ifade EDEMEZ - "Type must not be ByRef" hatasıyla çöker (deneyerek
+            // bulduk). Böyle durumlarda runtime'da özel bir delegate tipi sentezliyoruz.
+            if (paramTypes.Any(t => t.IsByRef) || paramTypes.Length > 16)
+            {
+                return DynamicDelegateTypeFactory.GetOrCreate(paramTypes, returnType);
+            }
+
             if (returnType == typeof(void))
             {
                 return paramTypes.Length == 0 ? typeof(Action) : Expression.GetActionType(paramTypes);
@@ -127,13 +156,15 @@ namespace DSO.Core.Evoker.Extend
             return Expression.GetFuncType(funcTypeArgs);
         }
 
-        private static readonly MethodInfo AddMethodGenericDefinition =
-            typeof(DynamicClass).GetMethod(nameof(DynamicClass.AddMethod))!;
-
         public static void AddMethodDynamic(DynamicClass dc, string methodName, Type delegateType)
         {
-            MethodInfo generic = AddMethodGenericDefinition.MakeGenericMethod(delegateType);
-            generic.Invoke(dc, new object[] { methodName });
+            // Artık DynamicClass.AddMethod(string,Type) non-generic overload'ı sayesinde
+            // reflection/MakeGenericMethod hack'ine gerek yok - doğrudan çağırıyoruz. Bu aynı
+            // zamanda `ref`/`out` içeren (runtime'da sentezlenmiş) delegate tipleri için de
+            // ÇALIŞIR - eskiden generic AddMethod<TDelegate>'i MakeGenericMethod ile
+            // somutlaştırıyorduk, bu byref bir tip için zaten mümkün DEĞİLDİ (generic type
+            // argument olarak byref tip verilemez).
+            dc.AddMethod(methodName, delegateType);
         }
     }
 }

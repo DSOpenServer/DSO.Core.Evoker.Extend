@@ -1,4 +1,5 @@
 ﻿using DSO.Core.Evoker.Extend;
+using System.Reflection;
 
 namespace DSO.Core.Evoker.Extend.TestApi
 {
@@ -403,6 +404,224 @@ namespace DSO.Core.Evoker.Extend.TestApi
 
             Console.WriteLine();
             Console.WriteLine(failures == 0 ? "TÜM EXTEND (FAZ 1+2+3) TESTLERİ GEÇTİ ✅" : $"{failures} TEST BAŞARISIZ ❌");
+        }
+    }
+
+    public delegate bool TryParseDelegate(string input, out int result);
+    public delegate void AddByRefDelegate(ref int value, int amount);
+
+    public interface IParser
+    {
+        bool TryParse(string input, out int result);
+    }
+
+    public static class RefOutTests
+    {
+        // Delegate.CreateDelegate ile bağlanacak GERÇEK metotlar (lambda DEĞİL - runtime'da
+        // sentezlenmiş bir delegate tipine lambda yazamayız, ama gerçek bir metot grubu
+        // Delegate.CreateDelegate ile HERHANGİ bir uyumlu delegate tipine bağlanabilir).
+        private static bool MyTryParse(string input, out int result) => int.TryParse(input, out result);
+
+        public static void RunAll()
+        {
+            int failures = 0;
+            void Check(string name, bool condition, string detail = "")
+            {
+                if (condition) Console.WriteLine($"  [OK]   {name}");
+                else { Console.WriteLine($"  [FAIL] {name}  {detail}"); failures++; }
+            }
+
+            Console.WriteLine("=== TEST R1: Standalone AddMethod/SetMethod + 'out' + düz reflection çağrısı ===");
+            {
+                var dc = DynamicClass.CreateClass("StandaloneOutTest").AddMethod<TryParseDelegate>("TryParse");
+                dc.SetMethod<TryParseDelegate>("TryParse", (string input, out int result) => int.TryParse(input, out result));
+
+                var method = dc.Type.GetMethod("TryParse")!;
+                object?[] args = { "123", null };
+                object? ret = method.Invoke(dc.RawInstance, args);
+
+                Check("'out' değeri düz reflection ile doğru geldi", ret is true && (int)args[1]! == 123, $"ret={ret}, out={args[1]}");
+            }
+
+            Console.WriteLine("=== TEST R2: Standalone AddMethod/SetMethod + 'ref' + düz reflection çağrısı ===");
+            {
+                var dc = DynamicClass.CreateClass("StandaloneRefTest").AddMethod<AddByRefDelegate>("AddByRef");
+                dc.SetMethod<AddByRefDelegate>("AddByRef", (ref int value, int amount) => value += amount);
+
+                var method = dc.Type.GetMethod("AddByRef")!;
+                object?[] args = { 10, 5 };
+                method.Invoke(dc.RawInstance, args);
+
+                Check("'ref' değeri düz reflection ile doğru güncellendi", (int)args[0]! == 15, $"got={args[0]}");
+            }
+
+            Console.WriteLine("=== TEST R3: dc.InvokeMethod artık ref/out için SESSİZCE YANLIŞ SONUÇ VERMİYOR, AÇIKÇA REDDEDİYOR ===");
+            {
+                var dc = DynamicClass.CreateClass("InvokeMethodGuardTest").AddMethod<TryParseDelegate>("TryParse");
+                dc.SetMethod<TryParseDelegate>("TryParse", (string input, out int result) => int.TryParse(input, out result));
+
+                bool threw = false;
+                string? message = null;
+                try { dc.InvokeMethod<bool>("TryParse", "42", 0); }
+                catch (NotSupportedException ex) { threw = true; message = ex.Message; }
+
+                Check("dc.InvokeMethod artık NotSupportedException fırlatıyor (sessiz veri kaybı YOK)", threw, $"message={message}");
+            }
+
+            Console.WriteLine("=== TEST R4: Implement<IParser>() - 'out' İÇEREN interface artık ÇÖKMÜYOR ===");
+            {
+                var dc = DynamicClass.CreateClass("ParserImplTest").Implement<IParser>();
+                Check("Implement<IParser>() ArgumentException fırlatmadan tamamlandı", true);
+
+                // Auto-derive edilen delegate tipini alıp GERÇEK bir metotla (lambda değil!) bağlıyoruz.
+                Type delegateType = dc.GetMethodDelegateType("TryParse");
+                Delegate impl = Delegate.CreateDelegate(delegateType, typeof(RefOutTests).GetMethod(nameof(MyTryParse), BindingFlags.NonPublic | BindingFlags.Static)!);
+                dc.SetMethod("TryParse", impl);
+
+                // Interface üzerinden (normal C# virtual call ile) çağıralım - out değeri BURADA sorunsuz gelir.
+                IParser typed = dc.As<IParser>();
+                bool ok = typed.TryParse("777", out int result);
+
+                Check("Interface üzerinden 'out' değeri doğru geldi", ok && result == 777, $"ok={ok}, result={result}");
+            }
+
+            Console.WriteLine("=== TEST R5: 'ref' parametreli metot GetMethodDelegateType'ta doğru tip mi döndürüyor ===");
+            {
+                var dc = DynamicClass.CreateClass("RefTypeCheckTest").AddMethod<AddByRefDelegate>("AddByRef");
+                Type dt = dc.GetMethodDelegateType("AddByRef");
+                Check("GetMethodDelegateType doğru tipi döndürdü", dt == typeof(AddByRefDelegate), $"got={dt.Name}");
+            }
+
+            Console.WriteLine("=== TEST R6: SetMethod(string,Delegate) tip uyuşmazlığında hata veriyor mu ===");
+            {
+                var dc = DynamicClass.CreateClass("MismatchTest").AddMethod<Action>("DoIt");
+                bool threw = false;
+                try { dc.SetMethod("DoIt", (Action<int>)(x => { })); } // yanlış delegate tipi
+                catch (ArgumentException) { threw = true; }
+                Check("Yanlış delegate tipi ArgumentException fırlattı", threw);
+            }
+
+            Console.WriteLine();
+            Console.WriteLine(failures == 0 ? "TÜM ref/out TESTLERİ GEÇTİ ✅" : $"{failures} TEST BAŞARISIZ ❌");
+        }
+    }
+
+    public interface IGenericContainer
+    {
+        T Echo<T>(T value);
+        void Log<T>(T value);
+        TResult Convert<TInput, TResult>(TInput input);
+    }
+
+    public abstract class GenericBase
+    {
+        public abstract T GetDefault<T>();
+        public string NonGenericConcrete() => "somut metot, dokunulmadı";
+    }
+
+    public static class GenericMethodTests
+    {
+        public static void RunAll()
+        {
+            int failures = 0;
+            void Check(string name, bool condition, string detail = "")
+            {
+                if (condition) Console.WriteLine($"  [OK]   {name}");
+                else { Console.WriteLine($"  [FAIL] {name}  {detail}"); failures++; }
+            }
+
+            Console.WriteLine("=== TEST G1: Standalone AddGenericMethod - HİÇ interface OLMADAN ===");
+            {
+                var templateMethod = typeof(IGenericContainer).GetMethod(nameof(IGenericContainer.Echo))!;
+                // NOT: standalone kullanımda da bir 'şekil' vermek için var olan bir MethodInfo
+                // (burada bir interface'in metodu) template olarak veriliyor - core'un kendisi
+                // interface implementasyonu YAPMIYOR, sadece imzayı kopyalıyor.
+                var dc = DynamicClass.CreateClass("StandaloneGenericTest").AddGenericMethod(templateMethod);
+
+                dc.SetGenericMethod("Echo", (typeArgs, args) =>
+                {
+                    Console.WriteLine($"    [delegate] T={typeArgs[0].Name}, value={args[0]}");
+                    return args[0];
+                });
+
+                var method = dc.Type.GetMethod("Echo")!;
+                var intEcho = method.MakeGenericMethod(typeof(int));
+                object? intResult = intEcho.Invoke(dc.RawInstance, new object[] { 42 });
+
+                var stringEcho = method.MakeGenericMethod(typeof(string));
+                object? stringResult = stringEcho.Invoke(dc.RawInstance, new object[] { "merhaba" });
+
+                Check("Echo<int>(42) doğru çalıştı", intResult is int i && i == 42, $"got={intResult}");
+                Check("Echo<string>(\"merhaba\") doğru çalıştı", stringResult is string s && s == "merhaba", $"got={stringResult}");
+            }
+
+            Console.WriteLine("=== TEST G2: Implement<IGenericContainer>() - interface'ten OTOMATİK, birden fazla generic metot ===");
+            {
+                var dc = DynamicClass.CreateClass("ImplGenericTest").Implement<IGenericContainer>();
+
+                dc.SetGenericMethod("Echo", (typeArgs, args) => args[0]);
+                dc.SetGenericMethod("Log", (typeArgs, args) => { Console.WriteLine($"    [Log<{typeArgs[0].Name}>] {args[0]}"); return null; });
+                dc.SetGenericMethod("Convert", (typeArgs, args) =>
+                {
+                    // Convert<TInput,TResult>(TInput input) - basit bir örnek: ToString() + parse
+                    if (typeArgs[1] == typeof(string)) return args[0]?.ToString();
+                    return System.Convert.ChangeType(args[0], typeArgs[1]);
+                });
+
+                IGenericContainer typed = dc.As<IGenericContainer>();
+
+                Check("Interface üzerinden Echo<int> çalışıyor", typed.Echo(99) == 99);
+                Check("Interface üzerinden Echo<string> çalışıyor", typed.Echo("test") == "test");
+
+                typed.Log(123); // sadece çökmemeli
+
+                string converted = typed.Convert<int, string>(456);
+                Check("Interface üzerinden Convert<int,string> çalışıyor", converted == "456", $"got={converted}");
+            }
+
+            Console.WriteLine("=== TEST G3: Extend<GenericBase>() - abstract generic metot + SOMUT metot miras alımı ===");
+            {
+                var dc = DynamicClass.CreateClass("ExtendGenericTest").Extend<GenericBase>();
+                dc.SetGenericMethod("GetDefault", (typeArgs, args) =>
+                {
+                    Type t = typeArgs[0];
+                    return t.IsValueType ? Activator.CreateInstance(t) : null;
+                });
+
+                var typed = (GenericBase)dc.RawInstance;
+                Check("Abstract generic metot (GetDefault<int>) çalışıyor", typed.GetDefault<int>() == 0);
+                Check("Abstract generic metot (GetDefault<string>) çalışıyor", typed.GetDefault<string>() == null);
+                Check("Base class'ın SOMUT metodu hâlâ miras alınmış durumda", typed.NonGenericConcrete() == "somut metot, dokunulmadı");
+            }
+
+            Console.WriteLine("=== TEST G4: SetGenericMethod ÇAĞRILMADAN çağrılırsa net hata ===");
+            {
+                var templateMethod = typeof(IGenericContainer).GetMethod(nameof(IGenericContainer.Echo))!;
+                var dc = DynamicClass.CreateClass("UnassignedGenericTest").AddGenericMethod(templateMethod);
+
+                var method = dc.Type.GetMethod("Echo")!.MakeGenericMethod(typeof(int));
+                bool threw = false;
+                try { method.Invoke(dc.RawInstance, new object[] { 1 }); }
+                catch (System.Reflection.TargetInvocationException ex) when (ex.InnerException is InvalidOperationException)
+                {
+                    threw = true;
+                }
+                Check("Atanmamış generic metot çağrısı net bir hata verdi", threw);
+            }
+
+            Console.WriteLine("=== TEST G5: AYNI ŞEMA + FARKLI generic metot -> şema cache KARIŞTIRMAMALI ===");
+            {
+                var t1 = typeof(IGenericContainer).GetMethod(nameof(IGenericContainer.Echo))!;
+                var t2 = typeof(IGenericContainer).GetMethod(nameof(IGenericContainer.Log))!;
+
+                var dc1 = DynamicClass.CreateClass("SameSchemaGeneric").AddProperty<int>("X").AddGenericMethod(t1);
+                var dc2 = DynamicClass.CreateClass("SameSchemaGeneric").AddProperty<int>("X").AddGenericMethod(t2);
+
+                Check("Aynı properties ama FARKLI generic method -> FARKLI Type üretildi", !ReferenceEquals(dc1.Type, dc2.Type));
+            }
+
+            Console.WriteLine();
+            Console.WriteLine(failures == 0 ? "TÜM GENERIC METOT TESTLERİ GEÇTİ ✅" : $"{failures} TEST BAŞARISIZ ❌");
         }
     }
 }

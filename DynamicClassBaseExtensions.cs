@@ -49,9 +49,13 @@ namespace DSO.Core.Evoker.Extend
                 .Where(p => (p.GetGetMethod(true)?.IsAbstract ?? false) || (p.GetSetMethod(true)?.IsAbstract ?? false))
                 .ToList();
 
-            var abstractMethods = baseType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
+            var allAbstractMethods = baseType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
                 .Where(m => m.IsAbstract && !m.IsSpecialName)
                 .ToList();
+
+            // Generic abstract metotlar (ör. `T Get<T>()`) AYRI bir yoldan gidiyor - bkz. FAZ 3b.
+            var abstractMethods = allAbstractMethods.Where(m => !m.IsGenericMethodDefinition).ToList();
+            var genericAbstractMethods = allAbstractMethods.Where(m => m.IsGenericMethodDefinition).ToList();
 
             foreach (var p in abstractProperties)
             {
@@ -62,6 +66,11 @@ namespace DSO.Core.Evoker.Extend
             {
                 Type delegateType = DelegateTypeResolver.Resolve(m);
                 DelegateTypeResolver.AddMethodDynamic(dc, m.Name, delegateType);
+            }
+
+            foreach (var m in genericAbstractMethods)
+            {
+                dc.AddGenericMethod(m);
             }
 
             dc.WithTypeConfigurator((typeBuilder, members) =>
@@ -89,6 +98,16 @@ namespace DSO.Core.Evoker.Extend
                     if (!members.Methods.TryGetValue(m.Name, out var forwarder))
                     {
                         throw new InvalidOperationException($"[Extend] '{m.Name}' metodu için üretilen forwarder bulunamadı.");
+                    }
+
+                    typeBuilder.DefineMethodOverride(forwarder.Method, m);
+                }
+
+                foreach (var m in genericAbstractMethods)
+                {
+                    if (!members.GenericMethods.TryGetValue(m.Name, out var forwarder))
+                    {
+                        throw new InvalidOperationException($"[Extend] '{m.Name}' (generic) metodu için üretilen forwarder bulunamadı.");
                     }
 
                     typeBuilder.DefineMethodOverride(forwarder.Method, m);
