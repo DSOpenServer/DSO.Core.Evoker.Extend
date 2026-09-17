@@ -22,6 +22,12 @@ namespace DSO.Core.Evoker.Extend
         /// <summary>
         /// dc'nin ürettiği tipin TInterface'i implement etmesini sağlar. Property'ler VE
         /// metotlar otomatik şemaya eklenir. Metotları SetMethod(...) ile doldurmayı unutmayın.
+        ///
+        /// ÖNEMLİ KISIT: TInterface PUBLIC olmalıdır. Dinamik tip AYRI bir assembly'de üretiliyor
+        /// (bkz. DynamicTypeFactory'nin paylaşımlı modülü) - internal bir interface'i implement
+        /// etmeye çalışırsanız CreateType() aşamasında "attempting to implement an inaccessible
+        /// interface" TypeLoadException alırsınız (InternalsVisibleTo ile bile pratik değildir,
+        /// çünkü dinamik assembly'nin adı stabil/önceden bilinen bir şey değildir).
         /// </summary>
         public static DynamicClass Implement<TInterface>(this DynamicClass dc) where TInterface : class
         {
@@ -33,9 +39,21 @@ namespace DSO.Core.Evoker.Extend
                     $"[Extend] '{ifaceType.Name}' bir interface değil. Implement<T>() sadece interface'lerle kullanılabilir.");
             }
 
-            var properties = ifaceType.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+            var allProperties = ifaceType.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+
+            // FAZ 4b: Indexer'lar (this[int i]) reflection'da GetIndexParameters().Length > 0
+            // olan PropertyInfo'lardır. AddProperty mekanizmamız SADECE parametresiz get/set
+            // ifade edebiliyor - indexer'ın get_Item(index)/set_Item(index,value) imzasını
+            // temsil edemez. Bu yüzden indexer'lar METOT yolundan (AddMethod) gidiyor - zaten
+            // rastgele parametre listesini destekliyor, tam da ihtiyacımız olan bu.
+            // NOT (bilinen kısıt): AŞIRI YÜKLENMİŞ indexer'lar (this[int] VE this[string] gibi)
+            // desteklenmiyor - ikisi de "get_Item" adını paylaşır, DynamicClass.AddMethod bunu
+            // isim çakışması olarak (farklı imza, aynı isim) reddeder.
+            var properties = allProperties.Where(p => p.GetIndexParameters().Length == 0).ToArray();
+            var indexerProperties = allProperties.Where(p => p.GetIndexParameters().Length > 0).ToArray();
+
             var allMethods = ifaceType.GetMethods(BindingFlags.Public | BindingFlags.Instance)
-                .Where(m => !m.IsSpecialName) // get_X/set_X'leri (property accessor'ları) hariç tut
+                .Where(m => !m.IsSpecialName) // get_X/set_X/add_X/remove_X'i (özel accessor'lar) hariç tut
                 .ToList();
 
             // Generic metotlar (ör. `T Get<T>()`) AYRI bir yoldan gidiyor - Func<>/Action<>
@@ -44,7 +62,7 @@ namespace DSO.Core.Evoker.Extend
             var methods = allMethods.Where(m => !m.IsGenericMethodDefinition).ToList();
             var genericMethods = allMethods.Where(m => m.IsGenericMethodDefinition).ToList();
 
-            if (properties.Length == 0 && allMethods.Count == 0)
+            if (properties.Length == 0 && indexerProperties.Length == 0 && allMethods.Count == 0)
             {
                 throw new ArgumentException($"[Extend] '{ifaceType.Name}' hiç üye içermiyor - implement edecek bir şey yok.");
             }
@@ -63,6 +81,33 @@ namespace DSO.Core.Evoker.Extend
             foreach (var m in genericMethods)
             {
                 dc.AddGenericMethod(m);
+            }
+
+            var indexerAccessorMethods = new List<MethodInfo>();
+            foreach (var p in indexerProperties)
+            {
+                var getter = p.GetGetMethod();
+                if (getter != null)
+                {
+                    DelegateTypeResolver.AddMethodDynamic(dc, getter.Name, DelegateTypeResolver.Resolve(getter));
+                    indexerAccessorMethods.Add(getter);
+                }
+
+                var setter = p.GetSetMethod();
+                if (setter != null)
+                {
+                    DelegateTypeResolver.AddMethodDynamic(dc, setter.Name, DelegateTypeResolver.Resolve(setter));
+                    indexerAccessorMethods.Add(setter);
+                }
+            }
+
+            // FAZ 4c: event'ler (ör. `event EventHandler Changed;`). add_X/remove_X metotları
+            // zaten yukarıdaki `!IsSpecialName` filtresiyle "methods" listesinden HARİÇ tutuldu -
+            // burada AYRI olarak, gerçek bir CLR event'i olarak ekleniyor.
+            var events = ifaceType.GetEvents(BindingFlags.Public | BindingFlags.Instance);
+            foreach (var e in events)
+            {
+                dc.AddEvent(e.Name, e.EventHandlerType!);
             }
 
             dc.WithTypeConfigurator((typeBuilder, members) =>
@@ -101,6 +146,30 @@ namespace DSO.Core.Evoker.Extend
                     }
 
                     typeBuilder.DefineMethodOverride(forwarder.Method, m);
+                }
+
+                foreach (var m in indexerAccessorMethods)
+                {
+                    if (!members.Methods.TryGetValue(m.Name, out var forwarder))
+                    {
+                        throw new InvalidOperationException($"[Extend] '{m.Name}' (indexer) için üretilen forwarder bulunamadı.");
+                    }
+
+                    typeBuilder.DefineMethodOverride(forwarder.Method, m);
+                }
+
+                foreach (var e in events)
+                {
+                    if (!members.Events.TryGetValue(e.Name, out var eventForwarder))
+                    {
+                        throw new InvalidOperationException($"[Extend] '{e.Name}' event'i için üretilen forwarder bulunamadı.");
+                    }
+
+                    var ifaceAdd = e.GetAddMethod();
+                    if (ifaceAdd != null) typeBuilder.DefineMethodOverride(eventForwarder.Add, ifaceAdd);
+
+                    var ifaceRemove = e.GetRemoveMethod();
+                    if (ifaceRemove != null) typeBuilder.DefineMethodOverride(eventForwarder.Remove, ifaceRemove);
                 }
             });
 

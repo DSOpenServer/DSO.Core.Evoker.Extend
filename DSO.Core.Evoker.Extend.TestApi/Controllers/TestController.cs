@@ -24,5 +24,11 @@ namespace DSO.Core.Evoker.Extend.TestApi.Controllers
         {
             GenericMethodTests.RunAll();
         }
+
+        [HttpGet("Test13NewGapsTests")]
+        public void Test13NewGapsTests()
+        {
+            NewGapsTests.RunAll();
+        }
     }
 }

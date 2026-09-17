@@ -1,4 +1,5 @@
 ﻿using DSO.Core.Evoker.Extend;
+using System.Collections.Concurrent;
 using System.Reflection;
 
 namespace DSO.Core.Evoker.Extend.TestApi
@@ -511,6 +512,8 @@ namespace DSO.Core.Evoker.Extend.TestApi
         T Echo<T>(T value);
         void Log<T>(T value);
         TResult Convert<TInput, TResult>(TInput input);
+        bool TryGet<T>(string key, out T value);        // generic + out
+        void Increment<T>(ref T value, T amount) where T : struct; // generic + ref
     }
 
     public abstract class GenericBase
@@ -620,8 +623,292 @@ namespace DSO.Core.Evoker.Extend.TestApi
                 Check("Aynı properties ama FARKLI generic method -> FARKLI Type üretildi", !ReferenceEquals(dc1.Type, dc2.Type));
             }
 
+            Console.WriteLine("=== TEST G6: FAZ 3c - Generic + 'out' kombinasyonu (bool TryGet<T>(string, out T)) ===");
+            {
+                var dc = DynamicClass.CreateClass("GenericOutTest").Implement<IGenericContainer>();
+                var store = new Dictionary<string, object> { ["age"] = 42, ["name"] = "Ahmet" };
+
+                dc.SetGenericMethod("Echo", (typeArgs, args) => args[0]);
+                dc.SetGenericMethod("Log", (typeArgs, args) => null);
+                dc.SetGenericMethod("Convert", (typeArgs, args) => args[0]?.ToString());
+                dc.SetGenericMethod("TryGet", (typeArgs, args) =>
+                {
+                    // args[0] = key (string, normal), args[1] = holder (object[1]) çünkü 'out T value'
+                    // ÖNEMLİ SÖZLEŞME: T bir value type olabileceği için holder[0]'a ASLA çıplak
+                    // null koymayın (forwarder Unbox_Any ile açacak, null'da NullReferenceException
+                    // alırsınız) - "değer yok" durumunda bile typeArgs[0]'ın GEÇERLİ bir boxlanmış
+                    // varsayılan değerini koyun (value type için Activator.CreateInstance, reference
+                    // type için null GÜVENLİDİR çünkü Unbox_Any referans tiplerinde düz bir cast'tir).
+                    string key = (string)args[0]!;
+                    var holder = (object?[])args[1]!;
+                    Type t = typeArgs[0];
+                    if (store.TryGetValue(key, out var val) && t.IsInstanceOfType(val))
+                    {
+                        holder[0] = val;
+                        return true;
+                    }
+                    holder[0] = t.IsValueType ? Activator.CreateInstance(t) : null;
+                    return false;
+                });
+                dc.SetGenericMethod("Increment", (typeArgs, args) =>
+                {
+                    // args[0] = holder (ref T value), args[1] = amount (normal, aynı T)
+                    var holder = (object?[])args[0]!;
+                    dynamic current = holder[0]!;
+                    dynamic amount = args[1]!;
+                    holder[0] = current + amount;
+                    return null;
+                });
+
+                IGenericContainer typed = dc.As<IGenericContainer>();
+
+                bool found = typed.TryGet<int>("age", out int age);
+                Check("TryGet<int> ('out' + generic) doğru değeri buldu", found && age == 42, $"found={found}, age={age}");
+
+                bool notFound = typed.TryGet<int>("yok", out int missing);
+                Check("TryGet<int> olmayan key için false döndü", !notFound, $"notFound={notFound}");
+
+                int counter = 10;
+                typed.Increment(ref counter, 5);
+                Check("Increment<int> ('ref' + generic) doğru güncellendi", counter == 15, $"got={counter}");
+            }
+
             Console.WriteLine();
             Console.WriteLine(failures == 0 ? "TÜM GENERIC METOT TESTLERİ GEÇTİ ✅" : $"{failures} TEST BAŞARISIZ ❌");
+        }
+    }
+
+    // ==================== Madde 3: Event ====================
+    public interface IObservableThing
+    {
+        int Value { get; set; }
+        event EventHandler Changed;
+    }
+
+    // ==================== Madde 4: Indexer ====================
+    public interface IBag
+    {
+        int this[string key] { get; set; }
+        int Count { get; }
+    }
+
+    // ==================== Madde 14: Attribute enjeksiyonu ====================
+    [AttributeUsage(AttributeTargets.Class)]
+    public class MyMarkerAttribute : Attribute
+    {
+        public string Label { get; }
+        public MyMarkerAttribute(string label) { Label = label; }
+    }
+
+    [AttributeUsage(AttributeTargets.Property)]
+    public class MyFieldNameAttribute : Attribute
+    {
+        public string Name { get; }
+        public MyFieldNameAttribute(string name) { Name = name; }
+    }
+
+    public static class NewGapsTests
+    {
+        public static void RunAll()
+        {
+            int failures = 0;
+            void Check(string name, bool condition, string detail = "")
+            {
+                if (condition) Console.WriteLine($"  [OK]   {name}");
+                else { Console.WriteLine($"  [FAIL] {name}  {detail}"); failures++; }
+            }
+
+            Console.WriteLine("=== TEST N1: Standalone AddEvent/RaiseEvent - HİÇ interface OLMADAN ===");
+            {
+                var dc = DynamicClass.CreateClass("StandaloneEventTest").AddEvent<EventHandler>("Changed");
+
+                int callCount = 0;
+                EventHandler? handler = (s, e) => callCount++;
+
+                var addMethod = dc.Type.GetEvent("Changed")!.GetAddMethod()!;
+                addMethod.Invoke(dc.RawInstance, new object?[] { handler });
+
+                dc.RaiseEvent("Changed", dc.RawInstance, EventArgs.Empty);
+                dc.RaiseEvent("Changed", dc.RawInstance, EventArgs.Empty);
+
+                Check("Event 2 kez tetiklendi", callCount == 2, $"got={callCount}");
+
+                var removeMethod = dc.Type.GetEvent("Changed")!.GetRemoveMethod()!;
+                removeMethod.Invoke(dc.RawInstance, new object?[] { handler });
+                dc.RaiseEvent("Changed", dc.RawInstance, EventArgs.Empty);
+                Check("Remove sonrası tetiklenmedi", callCount == 2, $"got={callCount}");
+            }
+
+            Console.WriteLine("=== TEST N2: Implement<IObservableThing>() - interface event + normal C# += syntax ===");
+            {
+                var dc = DynamicClass.CreateClass("ImplEventTest").Implement<IObservableThing>();
+                dc.SetValue<int>("Value", 0);
+
+                IObservableThing typed = dc.As<IObservableThing>();
+
+                int callCount = 0;
+                int lastValue = -1;
+                typed.Changed += (s, e) => { callCount++; lastValue = ((IObservableThing)s!).Value; };
+
+                dc.SetValue<int>("Value", 42);
+                dc.RaiseEvent("Changed", dc.RawInstance, EventArgs.Empty);
+
+                Check("Interface event normal += ile abone olundu ve tetiklendi", callCount == 1, $"got={callCount}");
+                Check("Event handler doğru instance/değeri gördü", lastValue == 42, $"got={lastValue}");
+
+                typed.Changed -= (s, e) => { }; // farklı bir lambda -= etkisiz olmalı (normal .NET davranışı)
+                dc.RaiseEvent("Changed", dc.RawInstance, EventArgs.Empty);
+                Check("Yanlış handler ile -= çıkarma işe yaramadı (hâlâ 2 kez çağrılmalı)", callCount == 2, $"got={callCount}");
+            }
+
+            Console.WriteLine("=== TEST N3: Event'siz çağrı (kimse dinlemiyor) sessizce no-op ===");
+            {
+                var dc = DynamicClass.CreateClass("NoSubscriberEventTest").AddEvent<EventHandler>("Changed");
+                bool threw = false;
+                try { dc.RaiseEvent("Changed", dc.RawInstance, EventArgs.Empty); }
+                catch { threw = true; }
+                Check("Abone olunmamış event tetiklemesi hata vermedi", !threw);
+            }
+
+            Console.WriteLine("=== TEST N4: Implement<IBag>() - indexer (this[string]) interface üzerinden ===");
+            {
+                var dc = DynamicClass.CreateClass("BagImplTest").Implement<IBag>();
+
+                // Indexer setter/getter'ı SetMethod ile dolduruyoruz (get_Item/set_Item birer metot).
+                // Count İSE index parametresi olmayan NORMAL bir property - AddProperty/SetValue
+                // yoluna gider (metot değil), bu yüzden manuel senkronize ediyoruz.
+                var store = new Dictionary<string, int>();
+                dc.SetMethod<Func<string, int>>("get_Item", key => store.TryGetValue(key, out var v) ? v : 0);
+                dc.SetMethod<Action<string, int>>("set_Item", (key, value) => { store[key] = value; dc.SetValue<int>("Count", store.Count); });
+                dc.SetValue<int>("Count", 0);
+
+                IBag typed = dc.As<IBag>();
+                typed["a"] = 10;
+                typed["b"] = 20;
+
+                Check("Indexer üzerinden yazılan değer okunuyor", typed["a"] == 10 && typed["b"] == 20, $"a={typed["a"]}, b={typed["b"]}");
+                Check("Count property de çalışıyor (elle senkronize edilen normal property)", typed.Count == 2, $"got={typed.Count}");
+            }
+
+            Console.WriteLine("=== TEST N5: AddTypeAttribute / AddPropertyAttribute ===");
+            {
+                var dc = DynamicClass.CreateClass("AttributeTest")
+                    .AddProperty<int>("Id");
+                dc.AddTypeAttribute<MyMarkerAttribute>("test-etiketi");
+                dc.AddPropertyAttribute<MyFieldNameAttribute>("Id", "custom_id");
+                dc.SetValue<int>("Id", 1); // build tetikler
+
+                var typeAttr = dc.Type.GetCustomAttribute<MyMarkerAttribute>();
+                Check("Tip attribute'u uygulanmış", typeAttr != null && typeAttr.Label == "test-etiketi", $"got={typeAttr?.Label}");
+
+                var propAttr = dc.Type.GetProperty("Id")!.GetCustomAttribute<MyFieldNameAttribute>();
+                Check("Property attribute'u uygulanmış", propAttr != null && propAttr.Name == "custom_id", $"got={propAttr?.Name}");
+            }
+
+            Console.WriteLine("=== TEST N6: Warmup - fonksiyonel olarak çalışıyor mu (hata vermeden) ===");
+            {
+                var dc = DynamicClass.CreateClass("WarmupTest")
+                    .AddProperty<int>("Id")
+                    .AddProperty<string>("Name")
+                    .AddMethod<Func<int, int>>("Double");
+                dc.SetMethod<Func<int, int>>("Double", x => x * 2);
+                dc.SetValue<int>("Id", 1);
+                dc.SetValue<string>("Name", "test");
+
+                dc.Warmup(); // hata vermemeli
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                int result = dc.InvokeMethod<int>("Double", 21);
+                sw.Stop();
+
+                Check("Warmup sonrası metot doğru çalışıyor", result == 42, $"got={result}");
+                Check("Warmup sonrası property'ler hâlâ doğru", dc.GetValue<int>("Id") == 1 && dc.GetValue<string>("Name") == "test");
+            }
+
+            Console.WriteLine("=== TEST N7: İç içe DynamicClass property'si (bir dinamik tipin property'si başka bir dinamik tip) ===");
+            {
+                var address = DynamicClass.CreateClass("AddressType").AddProperty<string>("City");
+                address.SetValue<string>("City", "İstanbul");
+
+                var person = DynamicClass.CreateClass("PersonType")
+                    .AddProperty<string>("Name")
+                    .AddProperty("Address", address.Type); // İÇ İÇE - property tipi başka bir DynamicClass'ın ürettiği Type
+
+                person.SetValue<string>("Name", "Ahmet");
+                person.SetValue("Address", address.RawInstance); // object olarak set (nested instance)
+
+                Check("Person.Name doğru", person.GetValue<string>("Name") == "Ahmet");
+
+                object nestedAddress = person.GetValue("Address")!;
+                var cityGetter = DynamicEntityAccessor.GetGetter<string>(address.Type, "City");
+                Check("İç içe Address.City doğru okunuyor", cityGetter(nestedAddress) == "İstanbul", $"got={cityGetter(nestedAddress)}");
+            }
+
+            Console.WriteLine("=== TEST N8: Koleksiyon tipli property'ler (List<int>, int[], Dictionary<string,int>) ===");
+            {
+                var dc = DynamicClass.CreateClass("CollectionPropsTest")
+                    .AddProperty<List<int>>("Numbers")
+                    .AddProperty<int[]>("Tags")
+                    .AddProperty<Dictionary<string, int>>("Scores");
+
+                dc.SetValue("Numbers", new List<int> { 1, 2, 3 });
+                dc.SetValue("Tags", new[] { 10, 20 });
+                dc.SetValue("Scores", new Dictionary<string, int> { ["a"] = 1 });
+
+                var numbers = dc.GetValue<List<int>>("Numbers");
+                var tags = dc.GetValue<int[]>("Tags");
+                var scores = dc.GetValue<Dictionary<string, int>>("Scores");
+
+                Check("List<int> property doğru", numbers.Count == 3 && numbers[2] == 3, $"count={numbers.Count}");
+                Check("int[] property doğru", tags.Length == 2 && tags[1] == 20, $"len={tags.Length}");
+                Check("Dictionary<string,int> property doğru", scores["a"] == 1, $"got={scores.GetValueOrDefault("a")}");
+            }
+
+            Console.WriteLine("=== TEST N9: Thread-safety - AYNI DynamicClass'ı ÇOK THREAD'DEN EŞ ZAMANLI build etmek ===");
+            {
+                var dc = DynamicClass.CreateClass("ThreadSafetyBuildTest").AddProperty<int>("X");
+
+                var types = new ConcurrentBag<Type>();
+                var instances = new ConcurrentBag<object>();
+
+                Parallel.For(0, 50, i =>
+                {
+                    // Type/RawInstance property'leri EnsureBuilt() tetikler - 50 thread AYNI ANDA
+                    // ilk build'i tetiklemeye çalışıyor.
+                    types.Add(dc.Type);
+                    instances.Add(dc.RawInstance);
+                });
+
+                Check("50 thread'in hepsi AYNI Type'ı gördü (Type SADECE BİR KEZ üretildi)",
+                    types.Distinct().Count() == 1, $"distinct count={types.Distinct().Count()}");
+                Check("50 thread'in hepsi AYNI instance'ı gördü", instances.Distinct().Count() == 1);
+            }
+
+            Console.WriteLine("=== TEST N10: Thread-safety - eş zamanlı OnSet hook ekleme + SetValue çağrısı çakışmamalı (crash yok) ===");
+            {
+                var dc = DynamicClass.CreateClass("ThreadSafetyHookTest").AddProperty<int>("Counter");
+                dc.SetValue<int>("Counter", 0);
+
+                bool crashed = false;
+                try
+                {
+                    Parallel.Invoke(
+                        () => { for (int i = 0; i < 200; i++) dc.OnSet<int>("Counter", (o, n) => { }); },
+                        () => { for (int i = 0; i < 200; i++) dc.SetValue<int>("Counter", i); },
+                        () => { for (int i = 0; i < 200; i++) dc.GetValue<int>("Counter"); }
+                    );
+                }
+                catch (Exception ex)
+                {
+                    crashed = true;
+                    Console.WriteLine($"    Hata: {ex.GetType().Name}: {ex.Message}");
+                }
+
+                Check("Eş zamanlı hook ekleme + SetValue/GetValue çökmedi", !crashed);
+            }
+
+            Console.WriteLine();
+            Console.WriteLine(failures == 0 ? "TÜM YENİ AÇIK MADDE TESTLERİ GEÇTİ ✅" : $"{failures} TEST BAŞARISIZ ❌");
         }
     }
 }
